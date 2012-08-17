@@ -1,0 +1,8 @@
+stpwrap is a bash script wrapper for STP[1] that allows it work with KLEE[2] when using STP as an external SMTLIBv2 solver.
+
+This is needed because STP is not very compliant with SMTLIBv2.
+
+Written by Dan Liew.
+
+[1] https://sites.google.com/site/stpfastprover/
+[2] http://klee.llvm.org/

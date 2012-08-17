@@ -1,0 +1,159 @@
+#!/bin/bash
+
+STP="stp" #STP executable
+TMP_PATH="/tmp/stp-wrap-$$" #Path to temporary file
+
+#Array identifier regex
+ARRAY_REGEX='[a-zA-Z0-9_.-]\+'
+
+#get-value regex for sed. \1 = array identifier, \2 = array index
+GV_REGEX="^(get-value[ ]*([ ]*(select \(.${ARRAY_REGEX}\) (_ bv\([0-9]\)\+[ ]*[0-9]\+)[ ]*)[ ]*)[ ]*)$"
+
+#Stp output regex for sed. \1 = array identifier, \2 = index in hex, \3 = value in hex
+STP_OUTPUT_REGEX="^ASSERT( \(${ARRAY_REGEX}\)\[0x\([a-fA-F0-9]\+\)\][ ]*=[ ]*0x\([a-fA-F0-9]\+\)[ ]*);$"
+
+function usage()
+{
+	echo "Usage:"
+	echo "$0 <smtlibv2 file>"
+	echo "This is a bash script wrapper for STP that makes it behave in the way that KLEE expects"
+	exit 1;
+}
+
+function die()
+{
+	echo "Error: $1" >&2
+	exit 1
+}
+
+function cleanup()
+{
+	rm "${TMP_PATH}"
+}
+
+#Reads original SMTLIBv2 file and returns 0 if array values were requested, otherwise 1
+function asked-for-values()
+{
+	if [ $(grep -c '^(get-value' "${INPUT}") -gt 0 ]; then
+		return 0; #array values were requested
+	else
+		return 1;
+	fi
+}
+
+#Convert hex on stdin to decimal on stdout
+function hex2dec()
+{
+	while read input; do
+		echo "ibase=16;obase=10;${input}" | bc
+	done
+}
+
+#Reads output of STP and parses it to find a particular "array" with index "index" (in decimal)
+#Once this is found it prints the declaration of the array element value in the SMTLIBv2 language
+#Usage: print-array-value <array> <index>
+function print-array-value()
+{
+	#loop over ASSERT lines (from STP output)
+	for Sln in $(sed -n '/^ASSERT/=' "${TMP_PATH}"); do
+		
+		stpArrayName=$(sed -n "${Sln},${Sln}s/${STP_OUTPUT_REGEX}/\1/;${Sln}p" "${TMP_PATH}")
+
+		#Check for matched array name
+		if [ "$stpArrayName" != "$1" ]; then
+			continue; //move to next line
+		fi
+
+		#Get the index for the array in hex and convert to decimal
+		stpIndex=$(sed -n "${Sln},${Sln}s/${STP_OUTPUT_REGEX}/\2/;${Sln}p" "${TMP_PATH}" | hex2dec)
+		
+		#check index matches
+		if [ "$stpIndex" -ne "$2" ]; then
+			continue; //move to next line
+		fi
+
+		#Extract byte value in hex
+		byteValue=$(sed -n "${Sln},${Sln}s/${STP_OUTPUT_REGEX}/\3/;${Sln}p" "${TMP_PATH}")
+
+		#we have a match now print out in the output format of SMTLIBv2
+		echo "(((select ${stpArrayName} (_ bv${stpIndex} 32) ) #x${byteValue} ))"
+
+		return 0;
+
+	done;
+
+	echo "Warning: Match not found for array:'$1' with decimal index '$2'.Assuming value 0." >&2
+	echo "(((select $1 (_ bv$2 32) ) #x00 ))"
+}
+
+
+#Begin
+
+#Check we have the right number of arguments
+if [ $# -ne 1 ]; then
+	usage
+fi
+
+INPUT="$1"
+
+#check input exists and is readable
+if [ ! -r "${INPUT}" ]; then
+  die "Can't read input SMTLIBv2 file"
+fi
+
+#check it is possible to write temporary file
+touch "${TMP_PATH}" || die "Can't write to file ${TMP_PATH}"
+
+#Execute STP
+#We remove (set-option) and (get-value ) SMTLIBv2 commands because STP doesn't support them
+sed '/^(set-option/d;/^(get-value/d' "${INPUT}" | ${STP} -p --SMTLIB2 > "${TMP_PATH}"
+
+if [ $? -ne 0 ]; then
+	echo "(error \"Failed to execute STP.\")"
+	cleanup
+	exit 1;
+fi
+
+#Check what STP said about satisfiability (grap last line)
+IS_SAT=$( sed -n '$p' "${TMP_PATH}")
+
+#Consider the different expected outputs
+case "${IS_SAT}" in
+	
+	unknown)
+	echo ${IS_SAT}
+	;;
+
+	unsat)
+	echo ${IS_SAT}
+	;;
+
+	sat)
+	echo ${IS_SAT}
+
+	asked-for-values
+	if [ $? -eq 0 ]; then
+		#We now need to present array values to KLEE in the format
+		# (((select unnamed (_ bv0 32) ) #x0c))
+
+		#Loop over the (get-value () ) lines in the input
+		# $ln is the lineNumber in the input file
+		for ln in $( sed -n '/^(get-value/=' "${INPUT}" ); do
+			
+			arrayName=$( sed -n "${ln},${ln}s/${GV_REGEX}/\1/;${ln}p" "${INPUT}")
+			arrayIndex=$( sed -n "${ln},${ln}s/${GV_REGEX}/\2/;${ln}p" "${INPUT}")
+			
+			print-array-value "$arrayName" "$arrayIndex"
+
+		done
+
+	fi
+
+	;;
+
+	*)
+	die "STP did not respond in an expected way. Check STP's output in ${TMP_PATH}"
+esac
+
+cleanup
+exit 0
